@@ -1,0 +1,427 @@
+# setup
+import requests
+import pandas as pd
+from collections import defaultdict
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import time
+from functools import reduce
+import argparse
+
+class Greenhouse():
+    '''Greenhouse (*greenhouse.io*) scraper.'''
+    def __init__(self, csv_in: str, csv_out: str):
+        '''Intialize a Greenhouse instance.
+        
+        Params:
+            csv_in: 
+                str - Filepath to a company-names csv. This csv should have the following 
+                columns: [slug].
+
+            csv_out:
+                str - Filepath to desired results location. The resulting csv will have the 
+                following columns: [slug, company_name, title, board_id, url, date_posted, 
+                date_scraped].
+        '''
+        self.df = pd.read_csv(csv_in)
+        self.csv_out = csv_out
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
+    def fetch_slug(self, slug: str) -> list | int:
+        '''Will fetch a companies job listings using the Greenhouse Job Board API.
+        
+        Params:
+            slug:
+                str - The slug to request.
+        
+        Returns:
+            list | str - A list of all jobs; if an error occurs, the int status code will be returned.
+        '''
+        try:
+            # retrieve
+            res = self.session.get(f'https://boards-api.greenhouse.io/v1/boards/{slug}/jobs')
+
+            # detect error
+            if not res.ok: raise Exception(res.status_code)
+
+            # return jobs
+            res_json = res.json()
+            return res_json['jobs']
+            
+        except Exception as e:
+            return int(str(e))
+
+    def fetch_jobs(
+            self,
+            limit: int= -1
+        ) -> dict:
+        '''Scrape Greenhouse for jobs using the defined slugs.
+        
+        ### Rate limit: 
+            Greenhouse defines no rate limit on their job board API, however they define a 
+            50-per-10-second limit on their audit log API, so to respect this we will use a 
+            **.2s** delay.
+        
+        Params:
+            limit:
+                int=-1 - Limit of company slugs to check. -1 to search all possible slugs.
+            
+        Returns:
+            dict - A dictionary of results. results[slug] = job list | error code
+        '''
+
+        # --- create variables
+        results = defaultdict()
+        i = 0
+        # stats
+        valid = 0
+        invalid = 0
+        has_jobs = 0
+        total_jobs = 0
+
+        # --- begin scrape
+        start_time = time.time()
+        print('id   slug                                               response           total/error')
+        for slug in self.df.slug:
+            if i == limit: break
+            # - fetch
+            res = self.fetch_slug(slug)
+
+            # - validate
+            if isinstance(res, list):
+                valid += 1
+                if len(res) > 0:
+                    has_jobs += 1
+                    total_jobs += len(res)
+                print(f'{i:<4} {slug:<40}           valid              total: {len(res)}')
+            else:
+                invalid += 1
+                print(f'{i:<4} {slug:<40}           invalid            error: {res}')
+
+            # - update
+            results[slug] = res
+            i += 1
+
+            # respect rate limit
+            time.sleep(0.2)
+        end_time = time.time()
+
+        # --- print stats
+        print('-'*103)
+        if i > 0:
+            print(f'''scrape results:
+    scraping time:        {end_time-start_time:.1f}s ({(end_time-start_time) / 60:.2f}m)
+    scraped slugs:        {i}
+    total jobs:           {total_jobs}
+    -
+    valid slugs:          {valid} ({(valid/i)*100:.1f}%)
+    valid with jobs:      {has_jobs} 
+    invalid:              {invalid} ({(invalid/i)*100:.1f}%)
+''')
+        else:
+            print('no jobs scraped.')
+
+        return results
+
+    def process(
+            self,
+            results: dict, 
+        ) -> pd.DataFrame:
+        '''Will process a given input of job results.
+        
+        Params:
+            results: 
+                dict - Unprocessed scrape results.
+        
+        Returns:
+            pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+            the following columns: [slug, company_name, title, board_id, url, date_posted, 
+            date_scraped]
+        '''
+        df = pd.DataFrame(columns=['slug', 'company_name', 'title', 'board_id', 'url', 'date_posted', '_company_key'])
+
+        # iterate through all slugs, and extract information from all valid job listings
+        for slug in results.keys():
+            jobs = results[slug]
+            # process jobs
+            if isinstance(jobs, list) and len(jobs) > 0:
+                rows = []
+                for job in jobs:
+                    data = {
+                        'slug':             slug,
+                        'company_name':     str(job['company_name']).strip(),
+                        'title':            str(job['title']).strip().lower(), 
+                        'board_id':         job['id'],  
+                        'url':              job['absolute_url'],
+                        'date_posted':      pd.to_datetime(job['first_published'], utc=True), 
+                        '_company_key':     str(job['company_name']).strip().lower()
+                    }
+                    rows.append(data)
+                rows_df = pd.DataFrame(rows)
+                df = pd.concat([df, rows_df], ignore_index=True)
+
+        # add timestamp
+        df['date_scraped'] = pd.Timestamp.now(tz='UTC')
+        # remove duplicates
+        #   duplicates may occur in instances where we have two slugs with different capitilzation 
+        #   within our company slug file.
+        df = df.drop_duplicates(subset=['_company_key', 'board_id'], keep='first')
+        df = df.drop(columns=['_company_key'])
+        return df
+
+    def run(
+            self,
+            limit: int=-1,
+        ) -> pd.DataFrame:
+        '''Will perform the entire scraping and processing loop for Greenhouse. Saves results to
+        *self.csv_out*.
+        
+        Params:
+            limit:
+                int=-1 - Limit of company slugs to check. -1 to search all possible slugs.
+
+        Returns:
+                    pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+                    the following columns: [slug, company_name, title, board_id, url, date_posted, 
+                    date_scraped]
+        '''
+        unprocessed = self.fetch_jobs(limit)
+        processed = self.process(unprocessed)
+
+        # save as csv
+        processed.to_csv(self.csv_out)
+        return processed
+
+class SmartRecruiters():
+    '''SmartRecruiters (*smartrecruiters.com*) scraper.'''
+    def __init__(self, csv_in: str, csv_out: str):
+        '''Intialize a SmartRecruiters instance.
+        
+        Params:
+            csv_in: 
+                str - Filepath to a company-names csv. This csv should have the following 
+                columns: [slug].
+
+            csv_out:
+                str - Filepath to desired results location. The resulting csv will have the 
+                following columns: [slug, company_name, title, board_id, url, date_posted, 
+                date_scraped].
+        '''
+        self.df = pd.read_csv(csv_in)
+        self.csv_out = csv_out
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
+    def fetch_slug(self, slug: str) -> list | int:
+        '''Will fetch a companies job listings.
+        
+        Params:
+            slug:
+                str - The slug to request.
+        
+        Returns:
+            list | str - A list of all jobs; if an error occurs, the int status code will be returned.
+        '''
+        # smartrecruiters will give a max of 100 jobs at once.
+        # in the event a company has more than 100 jobs open, we must using a sliding window
+        checked = 0
+        total = None
+        content = []
+        try:
+            while total is None or checked < total:
+                # respect rate limit when sliding window
+                if checked > 0: time.sleep(0.1) 
+    
+                # retrieve
+                res = self.session.get(
+                    f'https://api.smartrecruiters.com/v1/companies/{slug}/postings',
+                    params={
+                        'limit': 100,
+                        'offset': checked
+                        }
+                    )
+    
+                # check 
+                if not res.ok: raise Exception(res.status_code) # return error code
+    
+                # process            
+                res_json = res.json()
+                if total is None: total = res_json['totalFound'] # update total
+                content += res_json['content']
+    
+                # slide window
+                checked += 100
+            return content   
+        except Exception as e:
+            return int(str(e))
+
+    def fetch_jobs(
+            self,
+            limit: int= -1
+        ) -> dict:
+        '''Scrape SmartRecruiters for jobs using the defined slugs.
+        
+        ### Rate limit: 
+            Smart recruiters lists an allowed 10 requests per second. We will use a **0.1s** delay.
+
+        Params:
+            limit:
+                int=-1 - Limit of company slugs to check. -1 to search all possible slugs.
+            
+        Returns:
+            dict - A dictionary of results. results[slug] = job list | error code
+        '''
+        # --- create variables
+        results = defaultdict()
+        i = 0
+        # stats
+        valid = 0
+        invalid = 0
+        has_jobs = 0
+        total_jobs = 0
+
+        # --- begin scrape
+        start_time = time.time()
+        print('id   slug                                               response           total/error')
+        for slug in self.df.slug:
+            if i == limit: break
+            # - fetch
+            res = self.fetch_slug(slug)
+
+            # - validate
+            if isinstance(res, list):
+                valid += 1
+                if len(res) > 0:
+                    has_jobs += 1
+                    total_jobs += len(res)
+                print(f'{i:<4} {slug:<40}           valid              total: {len(res)}')
+            else:
+                invalid += 1
+                print(f'{i:<4} {slug:<40}           invalid            error: {res}')
+
+            # - update
+            results[slug] = res
+            i += 1
+
+            # respect rate limit
+            time.sleep(0.1)
+        end_time = time.time()
+
+        # --- print stats
+        print('-'*103)
+        if i > 0:
+            print(f'''scrape results:
+    scraping time:        {end_time-start_time:.1f}s ({(end_time-start_time) / 60:.2f}m)
+    scraped slugs:        {i}
+    total jobs:           {total_jobs}
+    -
+    valid slugs:          {valid} ({(valid/i)*100:.1f}%)
+    valid with jobs:      {has_jobs} 
+    invalid:              {invalid} ({(invalid/i)*100:.1f}%)
+''')
+        else:
+            print('no jobs scraped.')
+
+        return results
+
+    def process(
+            self,
+            results: dict, 
+        ) -> pd.DataFrame:
+        '''Will process a given input of job results.
+        
+        Params:
+            results: 
+                dict - Unprocessed scrape results.
+        
+        Returns:
+            pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+            the following columns: [slug, company_name, title, board_id, url, date_posted, 
+            date_scraped]
+        '''
+        df = pd.DataFrame(columns=['slug', 'company_name', 'title', 'board_id', 'url', 'date_posted', '_company_key'])
+
+
+
+        ['id', 'name', 'uuid', 'jobAdId', 'defaultJobAd', 'refNumber', 'company', 'releasedDate', 'location', 'industry', 'department', 'function', 'typeOfEmployment', 'experienceLevel', 'customField', 'visibility', 'ref', 'creator', 'language']
+
+        # iterate through all slugs, and extract information from all valid job listings
+        for slug in results.keys():
+            jobs = results[slug]
+            # process jobs
+            if isinstance(jobs, list) and len(jobs) > 0:
+                rows = []
+                for job in jobs:
+                    data = {
+                        'slug':             slug,
+                        'company_name':     str(job['company']['name']).strip(),
+                        'title':            str(job['name']).strip().lower(), 
+                        'board_id':         job['id'],  
+                        'url':              job['ref'],
+                        'date_posted':      pd.to_datetime(job['releasedDate'], utc=True), 
+                        '_company_key':     str(job['company']['name']).strip().lower()
+                    }
+                    rows.append(data)
+                rows_df = pd.DataFrame(rows)
+                df = pd.concat([df, rows_df], ignore_index=True)
+
+        # add timestamp
+        df['date_scraped'] = pd.Timestamp.now(tz='UTC')
+        # remove duplicates
+        #   duplicates may occur in instances where we have two slugs with different capitilzation 
+        #   within our company slug file.
+        df = df.drop_duplicates(subset=['_company_key', 'board_id'], keep='first')
+        df = df.drop(columns=['_company_key'])
+        return df
+
+    def run(
+            self,
+            limit: int=-1,
+        ) -> pd.DataFrame:
+        '''Will perform the entire scraping and processing loop for Greenhouse. Saves results to
+        *self.csv_out*.
+        
+        Params:
+            limit:
+                int=-1 - Limit of company slugs to check. -1 to search all possible slugs.
+
+        Returns:
+                    pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+                    the following columns: [slug, company_name, title, board_id, url, date_posted, 
+                    date_scraped]
+        '''
+        unprocessed = self.fetch_jobs(limit)
+        processed = self.process(unprocessed)
+
+        # save as csv
+        processed.to_csv(self.csv_out)
+        return processed
+
+def main(ats, csv_in, csv_out, limit):
+    scraper = None
+
+    match ats:
+        case 'greenhouse':
+            scraper = Greenhouse(csv_in, csv_out)
+        case 'smartrecruiters':
+            scraper = SmartRecruiters(csv_in, csv_out)
+        case _:
+            print('Invalid ATS system.')
+            return
+
+    scraper.run(limit)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Fetch job postings for an ATS system.")
+
+    parser.add_argument('ats', help='e.g. greenhouse')
+    parser.add_argument('--csv_in', required=True, help='CSV file to get company information from.')
+    parser.add_argument('--csv_out', required=True, help='CSV file to write results to.')
+    parser.add_argument('--limit', type=int, default=-1, help='Maximum companies to scrape. -1 for all companies. Default=-1')
+
+    args = parser.parse_args()
+
+    main(args.ats, args.csv_in, args.csv_out, args.limit)

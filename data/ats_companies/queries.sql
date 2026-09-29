@@ -29,7 +29,7 @@ ORDER BY slug;
 
 -- SMARTRECRUITERS
 SELECT DISTINCT
-    regexp_extract(url_path, '^/([A-Za-z0-9_-]+)', 1) AS slug
+    lower(regexp_extract(url_path, '^/([A-Za-z0-9_-]+)', 1) AS slug)
 FROM "ccindex"."ccindex"
 WHERE 
     crawl IN ('CC-MAIN-2026-39', 'CC-MAIN-2026-34', 'CC-MAIN-2026-30', 
