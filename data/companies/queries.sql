@@ -1,5 +1,5 @@
 -- YOU CAN USE ANY OF THESE QUERIES FOR THEIR RESPECTIVE ATS WEBSITES
-
+-- IF A VALUE USES LOWER(), THAT MEANS IT IS NOT CASE SENSITIVE
 
 -- GREENHOUSE.IO
 SELECT DISTINCT
@@ -17,7 +17,7 @@ ORDER BY slug;
 
 -- ASHBY
 SELECT DISTINCT
-    regexp_extract(url_path, '^/([A-Za-z0-9_-]+)', 1) AS slug
+    lower(regexp_extract(url_path, '^/([A-Za-z0-9_-]+)', 1)) AS slug
 FROM "ccindex"."ccindex"
 WHERE 
     crawl IN ('CC-MAIN-2026-39', 'CC-MAIN-2026-34', 'CC-MAIN-2026-30', 
