@@ -41,7 +41,7 @@ ORDER BY slug;
 
 -- RECRUITEE
 SELECT DISTINCT
-    regexp_extract(url_host_name, '^([a-z0-9-]+)\.recruitee\.com$', 1) AS slug
+    lower(regexp_extract(url_host_name, '^([a-z0-9-]+)\.recruitee\.com$', 1)) AS slug
 FROM "ccindex"."ccindex"
 WHERE
     crawl IN ('CC-MAIN-2026-39', 'CC-MAIN-2026-34', 'CC-MAIN-2026-30', 
@@ -53,7 +53,7 @@ ORDER BY slug;
 
 -- BREEZYHR
 SELECT DISTINCT
-    regexp_extract(url_host_name, '^([a-z0-9-]+)\.breezy\.hr$', 1) AS slug
+    lower(regexp_extract(url_host_name, '^([a-z0-9-]+)\.breezy\.hr$', 1)) AS slug
 FROM "ccindex"."ccindex"
 WHERE
     crawl IN ('CC-MAIN-2026-39', 'CC-MAIN-2026-34', 'CC-MAIN-2026-30', 

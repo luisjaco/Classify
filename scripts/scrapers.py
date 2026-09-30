@@ -9,7 +9,7 @@ from functools import reduce
 import argparse
 
 # -------- #
-# DEFAULTS - FROM HOME DIRECTORY
+# COMMANDS - FROM HOME DIRECTORY
 
 # GREENHOUSE
 # python ./scripts/scrapers.py greenhouse --csv-in ./data/companies/greenhouse.csv --csv-out ./data/jobs/greenhouse_jobs.csv
@@ -19,8 +19,13 @@ import argparse
 
 # ASHBY
 # python ./scripts/scrapers.py ashby --csv-in ./data/companies/ashby.csv --csv-out ./data/jobs/ashby_jobs.csv
-# ----
 
+
+# BREEZY
+# python ./scripts/scrapers.py breezy --csv-in ./data/companies/breezy.csv --csv-out ./data/jobs/breezy_jobs.csv
+# -------- #
+
+# base class
 class Scraper():
     '''Base scraper class.'''
     def __init__(self, csv_in: str, csv_out: str):
@@ -38,6 +43,9 @@ class Scraper():
             self.session = requests.Session()
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
             self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
+    def _truncate(self, s, n):
+        return s if len(s) <= n else s[:n-1] + "…"
 
     def fetch():
         # fetch single companies job postings.
@@ -81,10 +89,10 @@ class Scraper():
                 if len(res) > 0:
                     has_jobs += 1
                     total_jobs += len(res)
-                print(f'{i:<4} {slug:<40}           valid              total: {len(res)}')
+                print(f'{i:<4} {self._truncate(slug, 40):<40}           valid              total: {len(res)}')
             else:
                 self.INVALID.add(slug)
-                print(f'{i:<4} {slug:<40}           invalid            error: {res}')
+                print(f'{i:<4} {self._truncate(slug, 40):<40}           invalid            error: {res}')
 
             # - update
             results[slug] = res
@@ -180,14 +188,16 @@ class Greenhouse(Scraper):
             res = self.session.get(f'https://boards-api.greenhouse.io/v1/boards/{slug}/jobs')
 
             # detect error
-            if not res.ok: raise Exception(res.status_code)
+            res.raise_for_status()
 
             # return jobs
             res_json = res.json()
             return res_json['jobs']
-            
+        except requests.exceptions.HTTPError as e:
+            return res.status_code
         except Exception as e:
-            return int(str(e))
+            print(f'------ unknown error occured for value {slug}: {e}')
+            return -1
 
     def process(
             self,
@@ -261,6 +271,7 @@ class SmartRecruiters(Scraper):
         checked = 0
         total = None
         content = []
+        res = None
         try:
             while total is None or checked < total:
                 # respect rate limit when sliding window
@@ -276,7 +287,7 @@ class SmartRecruiters(Scraper):
                     )
     
                 # check 
-                if not res.ok: raise Exception(res.status_code) # return error code
+                res.raise_for_status()
     
                 # process            
                 res_json = res.json()
@@ -286,8 +297,11 @@ class SmartRecruiters(Scraper):
                 # slide window
                 checked += 100
             return content   
+        except requests.exceptions.HTTPError as e:
+            return res.status_code
         except Exception as e:
-            return int(str(e))
+            print(f'------ unknown error occured for value {slug}: {e}')
+            return -1
 
     def process(
             self,
@@ -356,19 +370,22 @@ class Ashby(Scraper):
         Returns:
             list | str - A list of all jobs; if an error occurs, the int status code will be returned.
         '''
+        res = None
         try:
             # retrieve
             res = self.session.get(f'https://api.ashbyhq.com/posting-api/job-board/{slug}')
 
             # detect error
-            if not res.ok: raise Exception(res.status_code)
+            res.raise_for_status()
 
             # return jobs
             res_json = res.json()
             return res_json['jobs']
-            
+        except requests.exceptions.HTTPError as e:
+            return res.status_code
         except Exception as e:
-            return int(str(e))
+            print(f'------ unknown error occured for value {slug}: {e}')
+            return -1
 
     def process(
             self,
@@ -416,6 +433,89 @@ class Ashby(Scraper):
         df = df.drop(columns=['_company_key'])
         return df
 
+class Breezy(Scraper):
+    '''Breezy (*breezy.hr*) scraper.
+    
+    Rate limit
+    ---
+    Breezy defines an 100-requests/min rate limit, we will use a **0.6s** delay.
+    '''
+    DELAY=0.6
+    def __init__(self, csv_in: str, csv_out: str):
+        super().__init__(csv_in, csv_out)
+
+    def fetch(self, slug: str) -> list | int:
+        '''Will fetch a companies job listings.
+        
+        Params:
+            slug:
+                str - The slug to request.
+        
+        Returns:
+            list | str - A list of all jobs; if an error occurs, the int status code will be returned.
+        '''
+        res = None
+        try:
+            # retrieve
+            res = self.session.get(f'https://{slug}.breezy.hr/json')
+            
+            # detect error
+            res.raise_for_status()
+
+            # return jobs
+            res_json = res.json()
+            return res_json
+        except requests.exceptions.HTTPError as e:
+            return res.status_code
+        except Exception as e:
+            print(f'------ unknown error occured for value {slug}: {e}')
+            return -1
+
+    def process(
+            self,
+            results: dict, 
+        ) -> pd.DataFrame:
+        '''Will process a given input of job results.
+        
+        Params:
+            results: 
+                dict - Unprocessed scrape results.
+        
+        Returns:
+            pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+            the following columns: [slug, company_name, title, board_id, url, date_posted, 
+            date_scraped]
+        '''
+        df = pd.DataFrame(columns=['slug', 'company_name', 'title', 'board_id', 'url', 'date_posted', '_company_key'])
+
+        # iterate through all slugs, and extract information from all valid job listings
+        for slug in results.keys():
+            jobs = results[slug]
+            # process jobs
+            if isinstance(jobs, list) and len(jobs) > 0:
+                rows = []
+                for job in jobs:
+                    data = {
+                        'slug':             slug,
+                        'company_name':     str(job['company']['name']).strip(),
+                        'title':            str(job['name']).strip().lower(), 
+                        'board_id':         job['id'],  
+                        'url':              job['url'],
+                        'date_posted':      pd.to_datetime(job['published_date'], utc=True), 
+                        '_company_key':     str(job['company']['name']).strip().lower()
+                    }
+                    rows.append(data)
+                rows_df = pd.DataFrame(rows)
+                df = pd.concat([df, rows_df], ignore_index=True)
+
+        # add timestamp
+        df['date_scraped'] = pd.Timestamp.now(tz='UTC')
+        # remove duplicates
+        #   duplicates may occur in instances where we have two slugs with different capitilzation 
+        #   within our company slug file.
+        df = df.drop_duplicates(subset=['_company_key', 'board_id'], keep='first')
+        df = df.drop(columns=['_company_key'])
+        return df
 
 # -----
 
@@ -429,6 +529,8 @@ def main(ats, csv_in, csv_out, limit):
             scraper = SmartRecruiters(csv_in, csv_out)
         case 'ashby':
             scraper = Ashby(csv_in, csv_out)
+        case 'breezy':
+            scraper = Breezy(csv_in, csv_out)
         case _:
             print('Invalid ATS system.')
             return
