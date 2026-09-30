@@ -20,12 +20,14 @@ import argparse
 # ASHBY
 # python ./scripts/scrapers.py ashby --csv-in ./data/companies/ashby.csv --csv-out ./data/jobs/ashby_jobs.csv
 
-
 # BREEZY
 # python ./scripts/scrapers.py breezy --csv-in ./data/companies/breezy.csv --csv-out ./data/jobs/breezy_jobs.csv
+
+# RECRUITEE
+# python ./scripts/scrapers.py recruitee --csv-in ./data/companies/recruitee.csv --csv-out ./data/jobs/recruitee_jobs.csv
+
 # -------- #
 
-# base class
 class Scraper():
     '''Base scraper class.'''
     def __init__(self, csv_in: str, csv_out: str):
@@ -145,9 +147,9 @@ class Scraper():
         processed = self.process(unprocessed)
 
         # save as csv
-        print(f'saving results to "{self.csv_out}"...')
+        print(f'saving results to "{self.csv_out}"')
         processed.to_csv(self.csv_out)
-        print(f'results saved to "{self.csv_out}".')
+        print(f'results saved to "{self.csv_out}"')
         return processed   
 
     def get_invalid(self) -> set[str]:
@@ -517,7 +519,91 @@ class Breezy(Scraper):
         df = df.drop(columns=['_company_key'])
         return df
 
-# -----
+class Recruitee(Scraper):
+    '''Recruitee (*breezy.com*) scraper.
+    
+    Rate limit
+    ---
+    Recruitee defines an 1000-requests/min rate limit, we will use a **0.1s** delay.
+    '''
+    DELAY=0.1
+    def __init__(self, csv_in: str, csv_out: str):
+        super().__init__(csv_in, csv_out)
+
+    def fetch(self, slug: str) -> list | int:
+        '''Will fetch a companies job listings.
+        
+        Params:
+            slug:
+                str - The slug to request.
+        
+        Returns:
+            list | str - A list of all jobs; if an error occurs, the int status code will be returned.
+        '''
+        res = None
+        try:
+            # retrieve
+            res = self.session.get(f'https://{slug}.recruitee.com/api/offers/')
+            
+            # detect error
+            res.raise_for_status()
+
+            # return jobs
+            res_json = res.json()
+            return res_json['offers']
+        except requests.exceptions.HTTPError as e:
+            return res.status_code
+        except Exception as e:
+            print(f'------ unknown error occured for value {slug}: {e}')
+            return -1
+
+    def process(
+            self,
+            results: dict, 
+        ) -> pd.DataFrame:
+        '''Will process a given input of job results.
+        
+        Params:
+            results: 
+                dict - Unprocessed scrape results.
+        
+        Returns:
+            pd.DataFrame - DataFrame containing processed scrape information. DataFrame will contain
+            the following columns: [slug, company_name, title, board_id, url, date_posted, 
+            date_scraped]
+        '''
+        df = pd.DataFrame(columns=['slug', 'company_name', 'title', 'board_id', 'url', 'date_posted', '_company_key'])
+
+        # iterate through all slugs, and extract information from all valid job listings
+        for slug in results.keys():
+            jobs = results[slug]
+            # process jobs
+            if isinstance(jobs, list) and len(jobs) > 0:
+                rows = []
+                for job in jobs:
+                    data = {
+                        'slug':             slug,
+                        'company_name':     str(job['company_name']).strip(),
+                        'title':            str(job['sharing_title']).strip().lower(), 
+                        'board_id':         job['id'],  
+                        'url':              job['careers_url'],
+                        'date_posted':      pd.to_datetime(job['published_at'], utc=True), 
+                        '_company_key':     str(job['company_name']).strip().lower()
+                    }
+                    rows.append(data)
+                rows_df = pd.DataFrame(rows)
+                df = pd.concat([df, rows_df], ignore_index=True)
+
+        # add timestamp
+        df['date_scraped'] = pd.Timestamp.now(tz='UTC')
+        # remove duplicates
+        #   duplicates may occur in instances where we have two slugs with different capitilzation 
+        #   within our company slug file.
+        df = df.drop_duplicates(subset=['_company_key', 'board_id'], keep='first')
+        df = df.drop(columns=['_company_key'])
+        return df
+
+# -------- #
 
 def main(ats, csv_in, csv_out, limit):
     scraper = None
@@ -531,6 +617,8 @@ def main(ats, csv_in, csv_out, limit):
             scraper = Ashby(csv_in, csv_out)
         case 'breezy':
             scraper = Breezy(csv_in, csv_out)
+        case 'recruitee':
+            scraper = Recruitee(csv_in, csv_out)
         case _:
             print('Invalid ATS system.')
             return
